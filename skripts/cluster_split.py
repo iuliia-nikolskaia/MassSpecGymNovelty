@@ -2,6 +2,7 @@
 
 import argparse
 import gc
+import os
 import random
 
 import h5py
@@ -156,6 +157,11 @@ def main():
         default="cluster_split.csv",
         help="output CSV path",
     )
+    parser.add_argument(
+        "--smiles-dir",
+        default=None,
+        help="folder to save train_smiles.txt, val_smiles.txt and test_smiles.txt",
+    )
     args = parser.parse_args()
 
     random.seed(RANDOM_STATE)
@@ -163,6 +169,10 @@ def main():
 
     print("loading MassSpecGym...")
     msg = load_massspecgym()
+    # Remove all rows with spectra that has only one signal. 
+    # some of these spectra can come from different molecules, but the only peak have the same mass
+    # making them nearly identical for the models
+    msg = msg[msg['mzs'].str.split(',').apply(len) >= 2]
     unique_inchikey_msg = msg.drop_duplicates(subset="inchikey")
     unique_smiles = unique_inchikey_msg["smiles"].astype(str).tolist()
 
@@ -181,6 +191,17 @@ def main():
         args.output, index=False
     )
     print(f"wrote split to {args.output}")
+
+    if args.smiles_dir is not None:
+        os.makedirs(args.smiles_dir, exist_ok=True)
+        for fold in ("train", "val", "test"):
+            smiles = unique_inchikey_msg.loc[
+                unique_inchikey_msg["fold"] == fold, "smiles"
+            ].astype(str).tolist()
+            path = os.path.join(args.smiles_dir, f"{fold}_smiles.txt")
+            with open(path, "w") as f:
+                f.write("\n".join(smiles) + "\n")
+            print(f"wrote {len(smiles)} smiles to {path}")
 
 
 if __name__ == "__main__":
