@@ -8,12 +8,22 @@ import random
 import h5py
 import numpy as np
 from massspecgym.utils import load_massspecgym
+from rdkit import Chem
 from scipy.spatial.distance import squareform
 from sklearn.cluster import AgglomerativeClustering
 from sklearn.model_selection import train_test_split
 
 RANDOM_STATE = 42
 TOTAL_TEST_VAL_BUDGET = 5700
+
+
+def count_peaks(mzs):
+    if isinstance(mzs, str):
+        return len(mzs.split(","))
+    try:
+        return len(mzs)
+    except TypeError:
+        return 0 if mzs is None else 1
 
 
 def load_distance_submatrix(mces_path, unique_smiles):
@@ -172,7 +182,10 @@ def main():
     # Remove all rows with spectra that has only one signal. 
     # some of these spectra can come from different molecules, but the only peak have the same mass
     # making them nearly identical for the models
-    msg = msg[msg['mzs'].str.split(',').apply(len) >= 2]
+    print(msg.shape)
+    msg = msg[msg['mzs'].apply(count_peaks) >= 2]
+    print(msg.shape)
+
     unique_inchikey_msg = msg.drop_duplicates(subset="inchikey")
     unique_smiles = unique_inchikey_msg["smiles"].astype(str).tolist()
 
