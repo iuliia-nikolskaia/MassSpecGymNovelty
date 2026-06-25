@@ -3,7 +3,6 @@ from abc import ABC
 
 import pandas as pd
 import torch
-from torchmetrics import CosineSimilarity, MeanMetric
 from torchmetrics.functional.retrieval import retrieval_precision, retrieval_recall
 from torch_geometric.utils import unbatch
 
@@ -59,8 +58,7 @@ class NoveltyDetectionMassSpecGymModel(MassSpecGymModel, ABC):
         Called at the end of every batch. Logs the loss (if any) and, for the val/test
         stages, accumulates the per-molecule novelty scores and ground-truth labels into
         per-stage buffers. The novelty ranking is global, so the actual metrics are not
-        computed here but once at epoch end (see `evaluate_novelty`) on the concatenated
-        buffers.
+        computed here but once at epoch end on the concatenated buffers.
         """
 
         loss = outputs.get("loss") if isinstance(outputs, dict) else None
@@ -73,8 +71,7 @@ class NoveltyDetectionMassSpecGymModel(MassSpecGymModel, ABC):
                 prog_bar=True,
             )
 
-        # No global ranking on train (only loss is meaningful there)
-        if stage in self.log_only_loss_at_stages:
+        if stage in self.log_only_loss_at_stages or stage not in self._novelty_buffers:
             return
 
         # Accumulate this batch's scores/labels for the global epoch-end ranking
@@ -105,3 +102,9 @@ class NoveltyDetectionMassSpecGymModel(MassSpecGymModel, ABC):
 
     def on_validation_epoch_start(self):
             self._on_epoch_start(Stage.VAL)
+
+    def get_checkpoint_monitors(self) -> list[dict]:
+        monitors = [
+            {"monitor": f"{Stage.VAL.to_pref()}precision@100", "mode": "max", "early_stopping": True}
+        ]
+        return monitors
