@@ -1,4 +1,6 @@
 import argparse
+import os
+import sys
 from multiprocessing import Pool
 
 import h5py
@@ -10,31 +12,42 @@ from rdkit.Chem.Scaffolds.MurckoScaffold import GetScaffoldForMol
 from scipy.spatial.distance import squareform
 
 
-# computation was done on MetaCentrum with 16 cpus and 50gb of RAM  memory 
+# computation was done on MetaCentrum with 16 cpus and 50gb of RAM  memory
 # after parallelization with Pool, script runs in few minutes, without it ~12 hours
 
 _TRAIN_FPS = None
+_TOKENIZER = None
 
-# get number of edges in a molecule, used for normalizing MCES distances
-def _num_edges_worker(smi):
-    mol = Chem.MolFromSmiles(smi)
-    return mol.GetNumBonds() if mol is not None else np.nan
-
-# get normalized MCES distances: absolute MCES distance (mol1, mol2) / max (num_edges(mol1), num_edges(mol2))
-def get_normalized_mces(dists, dists_smiles, pool):
-    print("computing normalized distances")
-    edge_counts = np.array(
-        pool.map(_num_edges_worker, dists_smiles, chunksize=256)
-    )
-    norm_matrix = np.maximum.outer(edge_counts, edge_counts)
-    norm_matrix[norm_matrix == 0] = 1
-    return dists / norm_matrix
-
-# get minimum normalized MCES distance to training set for each molecule in fold
-def get_min_normalized_mces_ranking(normalized_dists, train_mask, fold_mask, fold):
-    print(f"computing min normalized MCES ranking for {fold} fold")
-    reduced_dists = normalized_dists[fold_mask, :][:, train_mask]
+# get minimum MCES distance to training set for each molecule in fold
+def get_min_mces_ranking(dists, train_mask, fold_mask, fold):
+    print(f"computing min MCES ranking for {fold} fold")
+    reduced_dists = dists[fold_mask, :][:, train_mask]
     return reduced_dists.min(axis=1)
+
+# per-metric novelty flags and the consensus "novel label" for a fold
+# a molecule is novel by a metric if:
+#   tanimoto:          (1 - tanimoto sim) in the top 10% of the fold
+#   fragment coverage: (1 - fragment coverage) in the top 10% of the fold
+#   scaffold:          its murcko scaffold is unique (not seen in train)
+#   mces:              min MCES distance to train >= 10
+# novel label is 1 when at least three of the four metrics agree, else 0
+def get_novel_label(fold_df, fold):
+    print(f"computing novel label for {fold} fold")
+    tanimoto = fold_df["tanimoto_distance"].astype(float)
+    frag_novelty = 1.0 - fold_df["fragment_coverage"].astype(float)
+
+    novel_tanimoto = tanimoto >= tanimoto.quantile(0.90)
+    novel_fragment = frag_novelty >= frag_novelty.quantile(0.90)
+    novel_scaffold = fold_df["unique_scaffold"].astype(bool)
+    novel_mces = fold_df["min_mces"].astype(float) >= 10
+
+    agreement = (
+        novel_tanimoto.astype(int)
+        + novel_fragment.astype(int)
+        + novel_scaffold.astype(int)
+        + novel_mces.astype(int)
+    )
+    return (agreement >= 3).astype(int)
 
 # get scaffold for a molecule in smiles format
 def _scaffold_worker(smi):
@@ -79,6 +92,44 @@ def get_tanimoto_ranking(train_smiles, fold_smiles, fold, pool, n_jobs):
     return [1 - s for s in max_sims]
 
 
+def _init_coverage_worker(psvae_path, vocab_path):
+    global _TOKENIZER
+    if psvae_path not in sys.path:
+        sys.path.insert(1, psvae_path)
+    from mol_bpe import Tokenizer
+    _TOKENIZER = Tokenizer(vocab_path)
+
+# fraction of atoms covered by fragments of at least min_frag_size atoms
+# fragments smaller than this are considered not meaningfully covered by the vocabulary
+def _piece_coverage(tokenizer, smiles, min_frag_size=3):
+    mol = tokenizer(smiles)
+    total = covered = 0
+    for n in mol.nodes:
+        size = len(mol.get_node(n).atom_mapping)
+        total += size
+        if size >= min_frag_size:
+            covered += size
+    return covered / total if total else 0.0
+
+def _coverage_worker(smiles):
+    try:
+        return _piece_coverage(_TOKENIZER, smiles, min_frag_size=3)
+    except Exception as e:
+        print(f"error occurred while processing {smiles}: {e}")
+        return 0.0
+
+# fragment coverage ranking for a fold: fraction of each molecule's atoms covered
+# by vocabulary fragments, computed with the PS-VAE BPE tokenizer
+def get_fragment_coverage(fold_smiles, fold, psvae_path, vocab_path, n_jobs):
+    print(f"computing fragment coverage for {fold} fold")
+    with Pool(
+        n_jobs,
+        initializer=_init_coverage_worker,
+        initargs=(psvae_path, vocab_path),
+    ) as cpool:
+        return cpool.map(_coverage_worker, fold_smiles, chunksize=128)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -93,8 +144,8 @@ def main():
     )
     parser.add_argument(
         "--output",
-        default="cluster_split.csv",
-        help="output CSV path",
+        default="cluster_split.tsv",
+        help="output TSV path",
     )
     parser.add_argument(
         "--n-jobs",
@@ -102,7 +153,18 @@ def main():
         default=16,
         help="number of worker processes",
     )
+    parser.add_argument(
+        "--psvae-path",
+        default="../../../PS-VAE/ps",
+        help="path to the PS-VAE 'ps' package providing the BPE Tokenizer",
+    )
+    parser.add_argument(
+        "--vocab-path",
+        default="data/fragmentation_vocab.txt",
+        help="path to the fragmentation vocabulary file",
+    )
     args = parser.parse_args()
+    psvae_path = os.path.abspath(args.psvae_path)
 
     split = pd.read_csv(args.split_path)
     fold_smiles = {
@@ -119,7 +181,8 @@ def main():
 
     split["tanimoto_distance"] = pd.NA
     split["unique_scaffold"] = pd.NA
-    split["min_normalized_mces"] = np.nan
+    split["min_mces"] = np.nan
+    split["fragment_coverage"] = np.nan
 
     for fold in ("val", "test"):
         scaffold_ranking = get_scaffold_ranking(
@@ -128,15 +191,17 @@ def main():
         tanimoto_ranking = get_tanimoto_ranking(
             fold_smiles["train"], fold_smiles[fold], fold, pool, args.n_jobs
         )
+        fragment_coverage = get_fragment_coverage(
+            fold_smiles[fold], fold, psvae_path, args.vocab_path, args.n_jobs
+        )
         fold_idx = split.index[split["fold"] == fold]
         split.loc[fold_idx, "unique_scaffold"] = scaffold_ranking
         split.loc[fold_idx, "tanimoto_distance"] = tanimoto_ranking
+        split.loc[fold_idx, "fragment_coverage"] = fragment_coverage
 
     with h5py.File(args.mces_path, "r") as f:
         dists = squareform(f["mces"][:])
         dists_smiles = f["mces_smiles_order"][:].astype(str).tolist()
-
-    normalized_dists = get_normalized_mces(dists, dists_smiles, pool)
     pool.close()
     pool.join()
     fold_smiles_sets = {fold: set(smiles) for fold, smiles in fold_smiles.items()}
@@ -146,18 +211,25 @@ def main():
     }
 
     for fold in ("val", "test"):
-        ranking = get_min_normalized_mces_ranking(
-            normalized_dists, masks["train"], masks[fold], fold
+        ranking = get_min_mces_ranking(
+            dists, masks["train"], masks[fold], fold
         )
         ranking_by_smiles = dict(
             zip([s for s, m in zip(dists_smiles, masks[fold]) if m], ranking)
         )
         fold_idx = split.index[split["fold"] == fold]
-        split.loc[fold_idx, "min_normalized_mces"] = split.loc[fold_idx, "smiles"].map(
+        split.loc[fold_idx, "min_mces"] = split.loc[fold_idx, "smiles"].map(
             ranking_by_smiles
         )
 
-    split.to_csv(args.output, index=False)
+    split["novel_label"] = pd.NA
+    for fold in ("val", "test"):
+        fold_idx = split.index[split["fold"] == fold]
+        split.loc[fold_idx, "novel_label"] = get_novel_label(
+            split.loc[fold_idx], fold
+        )
+
+    split.to_csv(args.output, sep="\t", index=False)
     print(f"wrote ranking to {args.output}")
 
 
