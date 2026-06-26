@@ -1,6 +1,7 @@
 import pandas as pd
 import torch
 from massspecgym.data.datasets import MassSpecDataset
+import massspecgym.utils as utils
 
 class NoveltyDataset(MassSpecDataset):
     """
