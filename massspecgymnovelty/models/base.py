@@ -12,7 +12,7 @@ import massspecgym.utils as utils
 class NoveltyDetectionMassSpecGymModel(MassSpecGymModel, ABC):
     def __init__(
         self,
-        at_ks: T.Iterable[int] = (50, 100, 200), 
+        at_ks: T.Iterable[int] = (500, 1000, 2000), 
         *args,
         **kwargs
     ):
@@ -105,6 +105,6 @@ class NoveltyDetectionMassSpecGymModel(MassSpecGymModel, ABC):
 
     def get_checkpoint_monitors(self) -> list[dict]:
         monitors = [
-            {"monitor": f"{Stage.VAL.to_pref()}precision@100", "mode": "max", "early_stopping": True}
+            {"monitor": f"{Stage.VAL.to_pref()}precision@1000", "mode": "max", "early_stopping": True}
         ]
         return monitors
